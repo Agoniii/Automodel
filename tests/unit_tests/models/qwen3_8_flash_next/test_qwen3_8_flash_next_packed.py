@@ -299,6 +299,7 @@ class _FakeMesh:
 
 def test_gdn_wrapper_builds_packed_segments_with_padding_tail(monkeypatch: pytest.MonkeyPatch) -> None:
     """Stashed global boundaries reach the blockdiag core with a pad segment."""
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
     from nemo_automodel.components.distributed.blockdiag_cp import BlockdiagCpModelState
     from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
     from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextGatedDeltaNet
@@ -493,6 +494,9 @@ def test_two_rank_packed_qsa_and_sharder_match_packed_cp1(tmp_path) -> None:
 
 def test_gdn_wrapper_synthesizes_document_ids_for_packed_conv(monkeypatch: pytest.MonkeyPatch) -> None:
     """cu_seqlens-only packed batches get per-token document IDs for conv."""
+    from unittest.mock import Mock
+
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
     from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
     from nemo_automodel.components.models.qwen3_8_flash_next.layers import Qwen3_8_FlashNextGatedDeltaNet
 
@@ -511,6 +515,9 @@ def test_gdn_wrapper_synthesizes_document_ids_for_packed_conv(monkeypatch: pytes
     gdn_config.linear_num_key_heads = 1
     gdn_config.linear_num_value_heads = 2
     layer = Qwen3_8_FlashNextGatedDeltaNet(gdn_config, layer_idx=0)
+
+    # This is the installed-kernel dispatch contract, not the torch fallback.
+    monkeypatch.setattr(layer, "causal_conv1d_fn", Mock())
 
     layer(torch.randn(1, 10, gdn_config.hidden_size), cu_seqlens=torch.tensor([0, 3, 10]))
     assert captured["cu_seqlens"].tolist() == [0, 3, 10]

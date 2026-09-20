@@ -311,6 +311,8 @@ def test_cp_enabled_text_model_requires_model_owned_batch_context() -> None:
 
 
 def test_gdn_override_synthesizes_one_contiguous_global_segment(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Exercise CUDA dispatch metadata; the numerical CPU path is tested separately.
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
     captured: list[BlockdiagCpModelState] = []
 
     def _capture_base_cp(

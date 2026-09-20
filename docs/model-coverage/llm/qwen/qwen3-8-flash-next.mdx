@@ -1,6 +1,6 @@
 ---
 title: "Qwen3.8-Flash-Next"
-description: "Fine-tune Qwen3.8-Flash-Next text and image/video inputs, with context parallelism available for text-only training."
+description: "Fine-tune Qwen3.8-Flash-Next text and image/video inputs with context parallelism and sequence packing."
 slug: model-coverage/large-language-models/qwen/qwen3-8-flash-next
 ---
 
@@ -131,8 +131,8 @@ setup.
   remain available to Engram hashing. mRoPE uses the Qwen3-VL image-grid and
   timestamped-video position rules; callers supplying positions must supply
   three T/H/W axes (or four axes with the leading text positions).
-- Multimodal training currently requires TP=PP=CP=1 and no sequence packing.
-  It accepts mixed image/video/text batches with right-tail padding. Vision
+- Multimodal training supports CP and sequence packing, separately or together,
+  with TP=PP=1. It accepts mixed image/video/text batches with right-tail padding. Vision
   parameters retain `model.visual.*` checkpoint names and use SDPA separately
   from the language decoder's FlexAttention QSA backend. Nonempty DeepStack
   configurations are rejected; the released checkpoint has no DeepStack layers.
@@ -173,12 +173,33 @@ setup.
   under their global DTensor FQNs, so DCP can reshard them when the owner world
   size changes. Checkpoints from the earlier rank-local owner format are not
   supported; resume from a native DTensor checkpoint or restart the optimizer.
-- CP is limited to language-only inputs with TP=PP=1. Non-packed
-  right-tail-padded batches and packed (THD) batches with `cu_seqlens` (or
-  loader `seq_lens`) are both supported; the same FlexAttention path serves
-  packed CUDA training, and packing is performed topology-independently.
-  Left padding, interior padding, TP, PP, and MTP remain unsupported.
-  Vision/video inputs are supported only without CP or sequence packing.
+- Multimodal CP computes global mRoPE before sharding and retains raw token IDs
+  for Engram. Each CP rank runs the full vision tower, splices global media
+  embeddings, and selects its contiguous decoder slice. Vision computation and
+  the initial full embedding buffer are replicated; this does not partition
+  image patches or video frames across CP ranks.
+- Packed multimodal inputs use one physical row. Neat document IDs, native
+  `cu_seqlens`, and loader `seq_lens` normalize to common document boundaries.
+  mRoPE resets per document; QSA, GatedDeltaNet, Engram hashes, and Engram
+  convolution respect the same boundaries. Padding is supported only at the
+  row tail, not between documents. Use `packing_format: neat` for the VLM CP
+  recipe; the generic THD loader's multi-axis CP restriction still applies.
+- The candidate
+  [CP2 + packed 4K multimodal recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_8_flash_next/qwen3_8_flash_next_180b_medpix_packed4k_cp2_ep64.yaml)
+  targets world size 64, EP64, and CP2. Tiny hybrid-model CPU/Gloo tests compare
+  image/video/text packs with independent documents, and CP2 plus DP2 x CP2
+  with serial references. They check forward values, all trainable gradients,
+  global gradient norm, clipping, accumulation, optimizer updates, and activation
+  checkpointing. CPU GatedDeltaNet uses a per-document reference with gathered
+  states; CUDA uses the existing FLA CP implementation. Without CP, packed GDN
+  also runs documents independently if the optional `causal-conv1d` kernel is
+  absent, so the plain convolution cannot read across document boundaries.
+  A CPU emulation of CUDA dispatch covers this fallback's outputs and gradients.
+  These tests do not
+  validate CUDA kernels, FSDP2/EP64 composition, full-checkpoint convergence,
+  throughput, or memory savings. Historical text-only results above predate
+  the new packed Engram boundary handling and are not a rerun of this change.
+- Left padding, interior padding, TP, PP, and MTP remain unsupported.
 
 ## References
 

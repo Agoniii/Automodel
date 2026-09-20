@@ -154,14 +154,34 @@ class Qwen3_8_FlashNextGatedDeltaNet(CPAwareGatedDeltaNet):
     def forward(self, hidden_states: torch.Tensor, **kwargs: object) -> torch.Tensor:
         """Route packed boundaries around the inherited non-CP varlen path.
 
-        Without CP, ``cu_seqlens`` flows to the inherited FLA varlen forward
-        unchanged. With an active CP mesh the boundaries describe the global
+        Without CP, CUDA with the optional causal-conv kernel uses the inherited
+        FLA varlen forward. CPU and the missing-conv-kernel fallback run each
+        document independently so both convolution and recurrence reset. With
+        an active CP mesh the boundaries describe the global
         packed row, so they are stashed for :meth:`_forward_with_cp` and the
         inherited dispatcher sees no ``cu_seqlens``.
+
+        Args:
+            hidden_states: States ``[batch, local_sequence, hidden]``; packed
+                inputs have batch size one. The per-document fallback works on
+                CPU and CUDA; installed CUDA kernels retain the varlen path.
+            **kwargs: Optional global ``cu_seqlens [documents + 1]`` and local
+                ``position_ids [axes, batch, local_sequence]`` for CP.
+
+        Returns:
+            States with the same shape and dtype as ``hidden_states``.
         """
         cu_seqlens = kwargs.pop("cu_seqlens", None)
         cp_active = self._cp_mesh is not None and self._cp_mesh.size() > 1
         if not cp_active or cu_seqlens is None:
+            if cu_seqlens is not None and (not hidden_states.is_cuda or self.causal_conv1d_fn is None):
+                # The plain torch conv has no segment-ID API, even when FLA's
+                # CUDA recurrence does. Reset both stages at every boundary.
+                bounds = cu_seqlens.tolist()
+                return torch.cat(
+                    [self._forward_no_cp(hidden_states[:, start:end]) for start, end in zip(bounds[:-1], bounds[1:])],
+                    dim=1,
+                )
             if cu_seqlens is not None and kwargs.get("attention_mask") is None:
                 # The inherited packed conv path reads per-token document IDs
                 # from ``attention_mask``. Synthesize them from the boundaries
@@ -194,7 +214,7 @@ class Qwen3_8_FlashNextGatedDeltaNet(CPAwareGatedDeltaNet):
                 local_sequence, hidden]``. Rank ``r`` owns global positions
                 ``[r * local_sequence, (r + 1) * local_sequence)``.
             position_ids: Local global positions of shape ``[batch,
-                local_sequence]`` or repeated text-RoPE axes of shape ``[axes,
+                local_sequence]`` or multimodal RoPE axes of shape ``[axes,
                 batch, local_sequence]``.
             seq_index: Optional local positions of shape ``[local_sequence]``
                 or ``[batch, local_sequence]``; ignored because Qwen3.8-Flash-Next's
@@ -231,6 +251,19 @@ class Qwen3_8_FlashNextGatedDeltaNet(CPAwareGatedDeltaNet):
                 boundary_values.append(global_sequence_length)
         cu_seqlens_cpu = torch.tensor(boundary_values, dtype=torch.long, device="cpu")
         cu_seqlens = cu_seqlens_cpu.to(hidden_states.device)
+        if not hidden_states.is_cuda:
+            from torch.distributed._functional_collectives import all_gather_tensor_autograd
+
+            full_states = all_gather_tensor_autograd(hidden_states.contiguous(), gather_dim=1, group=cp_group)
+            outputs = torch.cat(
+                [
+                    self._forward_no_cp(full_states[:, start:end])
+                    for start, end in zip(boundary_values[:-1], boundary_values[1:])
+                ],
+                dim=1,
+            )
+            start = dist.get_rank(cp_group) * hidden_states.shape[1]
+            return outputs[:, start : start + hidden_states.shape[1]]
         contiguous_state = BlockdiagCpModelState(
             group=cp_group,
             packed_cu_seqlens=cu_seqlens,
@@ -741,7 +774,9 @@ class Qwen3_8_FlashNextDecoderLayer(nn.Module):
 
         hidden_states = self._expand_initial_streams(hidden_states)
         if self.ple is not None:
-            hidden_states = hidden_states + self.ple(hidden_states, input_ids, cp_context=cp_context)
+            hidden_states = hidden_states + self.ple(
+                hidden_states, input_ids, cp_context=cp_context, cu_seqlens=attn_kwargs.get("cu_seqlens")
+            )
 
         attn_input, attn_residual = self.attn_hyper_connection.mix(hidden_states)
         if self.layer_type == "linear_attention":

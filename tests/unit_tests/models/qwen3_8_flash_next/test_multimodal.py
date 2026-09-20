@@ -237,7 +237,7 @@ def test_multimodal_native_save_reload_and_vision_adapter_storage(tmp_path) -> N
     assert torch.all(model.model.visual.patch_embed.proj.weight == 0.125)
 
 
-@pytest.mark.parametrize("failure", ["pixels", "grid", "count", "positions", "types", "packing", "cp"])
+@pytest.mark.parametrize("failure", ["pixels", "grid", "count", "positions", "types", "packing"])
 def test_invalid_multimodal_inputs_fail_explicitly(failure: str) -> None:
     model = _model()
     batch = _image_batch()
@@ -257,12 +257,8 @@ def test_invalid_multimodal_inputs_fail_explicitly(failure: str) -> None:
         batch["mm_token_type_ids"] = torch.zeros_like(batch["input_ids"])
         message = "mm_token_type_ids"
     elif failure == "packing":
-        batch["cu_seqlens"] = torch.tensor([0, 10])
-        message = "packing"
-    else:
-        with pytest.raises(NotImplementedError, match="cp_size=1"):
-            model.prepare_model_inputs_for_cp(batch)
-        return
+        batch["cu_seqlens"] = torch.tensor([1, 10])
+        message = "boundaries"
     with pytest.raises((ValueError, NotImplementedError), match=message):
         model(**batch)
 
@@ -326,8 +322,8 @@ def test_vision_activation_checkpointing_preserves_gradients() -> None:
 def test_multimodal_capabilities_and_meta_vision_initialization() -> None:
     config = _config()
     caps = Qwen3_8_FlashNextForConditionalGeneration.get_capabilities(config)
-    assert caps.supports_ep and not caps.supports_cp and not caps.supports_tp and not caps.supports_pp
-    assert not caps.supports_thd
+    assert caps.supports_ep and caps.supports_cp and not caps.supports_tp and not caps.supports_pp
+    assert caps.supports_thd
     reference = _model()
     # to_empty reproduces discarded storage at the meta materialization boundary.
     model = _model()

@@ -17,9 +17,9 @@
 This implementation uses the checkpoint's compressed-block QSA router and a
 FlexAttention sparse-GQA path for CUDA BF16 long-sequence SFT, with a PyTorch
 oracle for CPU and numerical parity. Pipeline and tensor parallelism remain
-unsupported. Text-only context parallelism uses a model-owned contiguous
+unsupported. Context parallelism uses a model-owned contiguous
 sequence shard for QSA, GDN, and PLE, and composes with sequence packing.
-Image/video training uses CP=1 without packing.
+Image/video training replicates vision over CP and shards the embedded sequence.
 """
 
 from __future__ import annotations
@@ -348,16 +348,6 @@ class Qwen3_8_FlashNextTextModelBackend(nn.Module):
                 raise ValueError(
                     "Qwen3.8-Flash-Next context parallelism requires global position_ids from its batch sharder"
                 )
-            candidate_positions = (
-                position_ids[1:] if position_ids.ndim == 3 and position_ids.shape[0] == 4 else position_ids
-            )
-            if candidate_positions.ndim == 3 and candidate_positions.shape[0] > 1:
-                repeated_text_positions = candidate_positions[:1].expand_as(candidate_positions)
-                if not bool(torch.equal(candidate_positions, repeated_text_positions)):
-                    raise NotImplementedError(
-                        "Qwen3.8-Flash-Next CP supports ordinary text positions only; genuinely different multi-axis mRoPE "
-                        "streams and packed THD are unsupported"
-                    )
         if position_ids is None:
             positions = torch.arange(sequence_length, device=inputs_embeds.device)
             position_ids = positions.view(1, 1, -1).expand(3, batch_size, -1)
@@ -503,38 +493,52 @@ class Qwen3_8_FlashNextModel(Qwen3_8_FlashNextMultimodalMixin, nn.Module):
         ):
             if input_ids is None:
                 raise ValueError("Raw input_ids are required for multimodal placeholder matching and Engram hashing")
-            if _qwen3_8_flash_next_cp_context is not None:
-                raise NotImplementedError("Qwen3.8-Flash-Next multimodal training requires cp_size=1")
-            packed_keys = (
-                "cu_seqlens",
-                "cu_seqlens_q",
-                "cu_seqlens_kv",
-                "cu_seqlens_padded",
-                "seq_lens",
-                "seq_lens_padded",
-            )
-            if any(kwargs.get(key) is not None for key in packed_keys) or kwargs.get("qkv_format") == "thd":
-                raise NotImplementedError("Qwen3.8-Flash-Next multimodal sequence packing is not supported")
+            context = _qwen3_8_flash_next_cp_context
+            if context is None:
+                prepared = dict(
+                    kwargs,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    pixel_values=pixel_values,
+                    pixel_values_videos=pixel_values_videos,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    mm_token_type_ids=mm_token_type_ids,
+                )
+                self.prepare_multimodal_positions(prepared)
+                position_ids = prepared.pop("position_ids")
+                attention_mask = prepared.pop("attention_mask", None)
+                for key in (
+                    "input_ids",
+                    "pixel_values",
+                    "pixel_values_videos",
+                    "image_grid_thw",
+                    "video_grid_thw",
+                    "mm_token_type_ids",
+                ):
+                    prepared.pop(key, None)
+                kwargs = prepared
+            elif position_ids is None:
+                raise ValueError("Multimodal CP requires mRoPE positions from the model-owned batch sharder")
+            vision_ids = input_ids if context is None else context.global_input_ids
+            if context is not None and inputs_embeds is not None:
+                raise ValueError("Multimodal CP embeds global raw IDs inside forward; inputs_embeds is unsupported")
             if inputs_embeds is None:
-                inputs_embeds = self.language_model.embed_tokens(input_ids)
+                inputs_embeds = self.language_model.embed_tokens(vision_ids)
             inputs_embeds = self._splice_vision_embeddings(
-                input_ids,
+                vision_ids,
                 inputs_embeds,
                 pixel_values=pixel_values,
                 pixel_values_videos=pixel_values_videos,
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,
             )
-            if position_ids is None and has_media:
-                position_ids, _ = self.get_rope_index(
-                    input_ids, mm_token_type_ids, image_grid_thw, video_grid_thw, attention_mask
-                )
-            elif has_media and (
-                position_ids.ndim != 3
-                or position_ids.shape[0] not in (3, 4)
-                or position_ids.shape[1:] != input_ids.shape
-            ):
-                raise ValueError("Multimodal position_ids must have shape [3 or 4, batch, sequence]")
+            if context is not None:
+                # Vision is replicated over CP; each rank backpropagates only
+                # through its sequence slice. The normal parameter reduction
+                # combines those contributions, without another CP scale factor.
+                inputs_embeds = inputs_embeds[:, context.local_sequence_start : context.local_sequence_end]
         return self.language_model(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
@@ -559,8 +563,8 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
 
     @classmethod
     def get_capabilities(cls, config: Qwen3_8_FlashNextConfig) -> ModelCapabilities:
-        """Keep context parallelism restricted to the text-only configuration."""
-        return ModelCapabilities(supports_cp=config.language_model_only, supports_ep=True)
+        """Declare contiguous CP and document-isolated packing for both variants."""
+        return ModelCapabilities(supports_cp=True, supports_ep=True, supports_thd=True)
 
     def get_model_layer_groups(self) -> dict[str, list[nn.Module]]:
         """Expose decoder and vision blocks to FSDP and activation checkpointing."""
@@ -708,16 +712,16 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
             returns local contiguous token tensors of shape ``[batch,
             padded_global_sequence / cp_size, ...]``.
         """
-        if not self.config.language_model_only or any(
-            batch.get(key) is not None
-            for key in ("pixel_values", "pixel_values_videos", "image_grid_thw", "video_grid_thw")
-        ):
-            raise NotImplementedError("Qwen3.8-Flash-Next multimodal training requires cp_size=1")
         del batch, num_chunks
+        sharder = (
+            shard_batch_for_qwen3_8_flash_next_cp
+            if self.config.language_model_only
+            else self.model.shard_multimodal_batch
+        )
         return {
             "cp_sharder": ContextParallelSharder(
                 shard_batch=partial(
-                    shard_batch_for_qwen3_8_flash_next_cp,
+                    sharder,
                     pad_multiple=self.config.text_config.indexer_compress_ratio,
                 ),
                 local_token_global_indices=contiguous_local_indices,

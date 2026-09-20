@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Contiguous context parallelism for the language-only Qwen3.8-Flash-Next model."""
+"""Contiguous context parallelism for the Qwen3.8-Flash-Next decoder."""
 
 from __future__ import annotations
 
@@ -23,8 +23,8 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from torch.distributed._functional_collectives import all_gather_tensor_autograd
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.nn.functional import all_gather as differentiable_all_gather
 
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ShardLayout,
@@ -163,7 +163,7 @@ def _validate_right_tail_mask(mask: torch.Tensor, input_ids: torch.Tensor) -> to
     positions = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0)
     if not bool(torch.equal(valid, positions < lengths.unsqueeze(1))):
         raise NotImplementedError(
-            "Qwen3.8-Flash-Next CP supports only right-tail padding; left padding, interior padding, and packing are unsupported"
+            "Qwen3.8-Flash-Next CP supports only right-tail padding; left and interior padding are unsupported"
         )
     return valid
 
@@ -213,9 +213,10 @@ def shard_batch_for_qwen3_8_flash_next_cp(
         batch: Mutable full-sequence batch. ``input_ids``, ``labels``, and
             optional ``attention_mask``/``padding_mask`` have shape ``[batch,
             global_sequence]``; ``position_ids`` has shape ``[batch,
-            global_sequence]``. A packed THD row uses batch size one plus
-            ``cu_seqlens`` or loader ``seq_lens`` document boundaries; packed
-            attention and padding masks remain unsupported.
+            global_sequence]`` or ``[3 or 4, batch, global_sequence]`` for mRoPE.
+            A packed row uses batch size one plus ``cu_seqlens`` or loader
+            ``seq_lens`` document boundaries; optional masks describe binary
+            right-tail validity, never indexed document IDs.
         loss_mask: Optional tensor of shape ``[batch, global_sequence]`` used
             by the shared sharder when labels are absent.
         padding_token_id: Raw token ID appended for CP divisibility.
@@ -291,10 +292,6 @@ def shard_batch_for_qwen3_8_flash_next_cp(
             raise ValueError(
                 "Qwen3.8-Flash-Next packed CP cu_seqlens must start at 0, be strictly increasing, and end at the "
                 f"packed token count {full_input_ids.shape[1]}"
-            )
-        if batch.get("attention_mask") is not None or batch.get("padding_mask") is not None:
-            raise ValueError(
-                "Qwen3.8-Flash-Next packed CP takes document boundaries from cu_seqlens; masks are unsupported"
             )
         packed_cu_seqlens = boundaries
 
@@ -401,7 +398,9 @@ def qwen3_8_flash_next_cp_all_gather(
     if context.group is None:
         raise RuntimeError("Qwen3.8-Flash-Next CP context is missing its process group")
     if differentiable:
-        parts = differentiable_all_gather(tensor.contiguous(), group=context.group)
+        # Functional collectives retain subgroup rank identity in backward;
+        # the legacy Gloo all-to-all fallback assumes world-rank sources.
+        return all_gather_tensor_autograd(tensor.contiguous(), gather_dim=sequence_dim, group=context.group)
     else:
         parts = [torch.empty_like(tensor) for _ in range(context.size)]
         dist.all_gather(parts, tensor.contiguous(), group=context.group)

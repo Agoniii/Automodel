@@ -850,11 +850,12 @@ class Qwen3_8_FlashNextNGramEmbedding(nn.Module):
         valid = (positions_in_segment >= shift) & (source_positions.unsqueeze(0) >= 0)
         return torch.where(valid, shifted_ids, input_ids.new_full((), self.eos_token_id))
 
-    def _hash_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def _hash_input_ids(self, input_ids: torch.Tensor, cu_seqlens: torch.Tensor | None = None) -> torch.Tensor:
         """Compute packed global table rows for every n-gram head.
 
         Args:
             input_ids: Raw integer tokenizer IDs of shape ``[batch, sequence]``.
+            cu_seqlens: Optional document boundaries [documents + 1] for one packed row.
 
         Returns:
             Global table IDs of shape ``[batch, sequence, ngram_heads]``. Heads
@@ -872,6 +873,14 @@ class Qwen3_8_FlashNextNGramEmbedding(nn.Module):
             raise ValueError(f"input_ids must have an integer dtype, got {input_ids.dtype}")
         input_ids = input_ids.to(dtype=torch.long)
         shifted_tokens = [self._shift_right_after_eos(input_ids, shift) for shift in range(self.ngram_size)]
+        if cu_seqlens is not None:
+            positions = torch.arange(input_ids.shape[1], device=input_ids.device)
+            boundaries = cu_seqlens.to(device=input_ids.device, dtype=torch.long)
+            starts = boundaries[torch.bucketize(positions, boundaries[1:], right=True)]
+            for shift in range(1, self.ngram_size):
+                shifted_tokens[shift] = torch.where(
+                    (positions - shift >= starts).unsqueeze(0), shifted_tokens[shift], self.eos_token_id
+                )
         blocks = []
         for ngram_order in range(2, self.ngram_size + 1):
             head_start = (ngram_order - 2) * self.heads_per_ngram
@@ -888,17 +897,18 @@ class Qwen3_8_FlashNextNGramEmbedding(nn.Module):
             blocks.append(block_ids)
         return torch.cat(blocks, dim=-1)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, *, cu_seqlens: torch.Tensor | None = None) -> torch.Tensor:
         """Return concatenated PLE table values for raw token IDs.
 
         Args:
             input_ids: Raw integer tokenizer IDs of shape ``[batch, sequence]``.
+            cu_seqlens: Optional document boundaries [documents + 1] for a packed row.
 
         Returns:
             Tensor of shape ``[batch, sequence, ngram_heads * head_dim]``. The
             final axis concatenates bigram heads before trigram heads.
         """
-        ngram_ids = self._hash_input_ids(input_ids)
+        ngram_ids = self._hash_input_ids(input_ids, cu_seqlens)
         return self._lookup_ngram_ids(ngram_ids)
 
     def _lookup_ngram_ids(self, ngram_ids: torch.Tensor) -> torch.Tensor:
@@ -928,6 +938,7 @@ class Qwen3_8_FlashNextNGramEmbedding(nn.Module):
         *,
         sequence_start: int,
         sequence_end: int,
+        cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Hash a complete raw sequence, then look up only one local slice.
 
@@ -937,6 +948,7 @@ class Qwen3_8_FlashNextNGramEmbedding(nn.Module):
                 preceding raw tokens and EOS resets at a CP boundary.
             sequence_start: Inclusive global position of the requested shard.
             sequence_end: Exclusive global position of the requested shard.
+            cu_seqlens: Optional global packed boundaries [documents + 1].
 
         Returns:
             Local PLE values of shape ``[batch, local_sequence,
@@ -948,7 +960,7 @@ class Qwen3_8_FlashNextNGramEmbedding(nn.Module):
                 "Invalid Qwen3.8-Flash-Next PLE global slice "
                 f"[{sequence_start}, {sequence_end}) for sequence length {global_input_ids.shape[1]}"
             )
-        global_ngram_ids = self._hash_input_ids(global_input_ids)
+        global_ngram_ids = self._hash_input_ids(global_input_ids, cu_seqlens)
         return self._lookup_ngram_ids(global_ngram_ids[:, sequence_start:sequence_end])
 
 
@@ -1063,6 +1075,7 @@ class Qwen3_8_FlashNextPLELayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cp_context: Qwen3_8_FlashNextCPContext | None = None,
+        cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply the PLE causal depthwise convolution with left zero history.
 
@@ -1072,6 +1085,7 @@ class Qwen3_8_FlashNextPLELayer(nn.Module):
             cp_context: Optional contiguous CP metadata. Under CP, ``sequence``
                 is local and the method exchanges only the preceding nine-token
                 boundary required by the released dilation/kernel settings.
+            cu_seqlens: Optional global document boundaries [documents + 1].
 
         Returns:
             Tensor of shape ``[batch, sequence, hc_count * hidden_size]``.
@@ -1082,6 +1096,20 @@ class Qwen3_8_FlashNextPLELayer(nn.Module):
         else:
             left_halo = qwen3_8_flash_next_cp_left_halo(hidden_states, cp_context, history=left_padding)
             channels_first = torch.cat((left_halo, hidden_states), dim=1).transpose(1, 2)
+        if cu_seqlens is not None:
+            # Mask each dilated tap independently; resetting just the CP halo
+            # does not isolate document boundaries inside a local shard.
+            start = 0 if cp_context is None else cp_context.local_sequence_start
+            positions = torch.arange(hidden_states.shape[1], device=hidden_states.device) + start
+            boundaries = cu_seqlens.to(device=hidden_states.device, dtype=torch.long)
+            doc_start = boundaries[torch.bucketize(positions, boundaries[1:], right=True)]
+            result = torch.zeros_like(hidden_states)
+            for tap in range(self.conv_kernel_size):
+                offset = tap * self.short_conv_dilation
+                values = channels_first[:, :, offset : offset + hidden_states.shape[1]].transpose(1, 2)
+                valid = positions - left_padding + offset >= doc_start
+                result = result + values * valid[None, :, None] * self.conv1d.weight[:, 0, tap]
+            return F.silu(result)
         convolved = F.conv1d(
             channels_first,
             self.conv1d.weight,
@@ -1097,6 +1125,7 @@ class Qwen3_8_FlashNextPLELayer(nn.Module):
         input_ids: torch.Tensor,
         *,
         cp_context: Qwen3_8_FlashNextCPContext | None = None,
+        cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute the PLE delta injected before the layer's attention HC read.
 
@@ -1104,6 +1133,7 @@ class Qwen3_8_FlashNextPLELayer(nn.Module):
             hidden_states: True HyperConnection state of shape
                 ``[batch, sequence, hc_count * hidden_size]``.
             input_ids: Raw integer tokenizer IDs of shape ``[batch, sequence]``.
+            cu_seqlens: Optional global packed boundaries [documents + 1].
             cp_context: Optional contiguous CP metadata. Its replicated
                 ``global_input_ids`` and ``global_padding_mask`` fields have
                 shape ``[batch, global_sequence]``; ``hidden_states`` and
@@ -1130,8 +1160,10 @@ class Qwen3_8_FlashNextPLELayer(nn.Module):
                 f"{tuple(input_ids.shape)} and {tuple(hidden_states.shape)}"
             )
 
+        if cp_context is not None:
+            cu_seqlens = cp_context.global_cu_seqlens
         if cp_context is None:
-            embeddings = self.ple_embedding(input_ids)
+            embeddings = self.ple_embedding(input_ids, cu_seqlens=cu_seqlens)
         else:
             if hidden_states.shape[1] != cp_context.local_sequence_length:
                 raise ValueError(
@@ -1142,6 +1174,7 @@ class Qwen3_8_FlashNextPLELayer(nn.Module):
                 cp_context.global_input_ids,
                 sequence_start=cp_context.local_sequence_start,
                 sequence_end=cp_context.local_sequence_end,
+                cu_seqlens=cu_seqlens,
             )
         if embeddings.shape != (*hidden_states.shape[:2], self.ple_embed_dim):
             raise RuntimeError(
@@ -1167,7 +1200,9 @@ class Qwen3_8_FlashNextPLELayer(nn.Module):
         normalized_gated_value = self._apply_branch_norm(self.norm_conv, gated_value)
         gated_value = gated_value.flatten(start_dim=-2)
         normalized_gated_value = normalized_gated_value.flatten(start_dim=-2)
-        return gated_value + self._causal_short_conv(normalized_gated_value, cp_context=cp_context)
+        return gated_value + self._causal_short_conv(
+            normalized_gated_value, cp_context=cp_context, cu_seqlens=cu_seqlens
+        )
 
     @torch.no_grad()
     def init_weights(self, initializer_range: float = 0.02) -> None:
