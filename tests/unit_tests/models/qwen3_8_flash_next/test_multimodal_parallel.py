@@ -126,9 +126,55 @@ def test_packed_media_matches_independent_documents_and_gradients(metadata: str)
     torch.testing.assert_close(model(**modified).logits[:, 14:length], actual[:, 14:length], atol=2e-6, rtol=2e-5)
 
 
-def _cp_worker(rank: int, world_size: int, rendezvous: str) -> None:
+def test_local_media_splice_preserves_multirow_feature_order_and_gradients() -> None:
+    """Local slices, including an empty-media slice, reproduce full-batch splicing."""
+    model, reference = _model(), _model()
+    ids = torch.tensor(
+        [
+            [2, 62, 60, 60, 60, 60, 63, 2, 3, 4, 5, 6],
+            [2, 3, 4, 5, 6, 62, 60, 60, 60, 60, 63, 2],
+        ]
+    )
+    pixels = torch.randn(32, 24, requires_grad=True)
+    reference_pixels = pixels.detach().clone().requires_grad_(True)
+    media = dict(image_grid_thw=torch.tensor([[1, 4, 4], [1, 4, 4]]), pixel_values_videos=None, video_grid_thw=None)
+    parts = []
+    for start, end in ((0, 2), (2, 8), (8, 12)):
+        local_embeds = model.model.language_model.embed_tokens(ids[:, start:end])
+        parts.append(
+            model.model._splice_vision_embeddings(
+                ids,
+                local_embeds,
+                pixel_values=pixels,
+                sequence_start=start,
+                **media,
+            )
+        )
+    actual = torch.cat(parts, dim=1)
+    expected = reference.model._splice_vision_embeddings(
+        ids,
+        reference.model.language_model.embed_tokens(ids),
+        pixel_values=reference_pixels,
+        **media,
+    )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    upstream = torch.randn_like(actual)
+    actual.backward(upstream)
+    expected.backward(upstream)
+    torch.testing.assert_close(pixels.grad, reference_pixels.grad, atol=2e-6, rtol=2e-5)
+    for (name, parameter), ref in zip(model.named_parameters(), reference.parameters(), strict=True):
+        torch.testing.assert_close(parameter.grad, ref.grad, atol=2e-6, rtol=2e-5, msg=lambda error: f"{name}: {error}")
+
+
+def _cp_worker(rank: int, world_size: int, rendezvous: str, frame_sharding: bool) -> None:
     from torch.distributed.device_mesh import init_device_mesh
     from torch.nn.parallel import DistributedDataParallel
+
+    from nemo_automodel.components.distributed.cp_vision_frame_shard import (
+        CpVisionFrameShardingConfig,
+        reset_cp_vision_group,
+        set_cp_vision_group,
+    )
 
     torch.set_num_threads(1)
     # Tiny replicated table; initialize before creating process groups.
@@ -149,16 +195,49 @@ def _cp_worker(rank: int, world_size: int, rendezvous: str) -> None:
 
             _apply_multimodal_tower_ac(model, ("all",))
             layers["1"] = checkpoint_wrapper(layers["1"])
+        embedding_lengths: list[int] = []
+        vision_patch_rows: list[int] = []
+
+        def record_embedding(module: torch.nn.Module, args: tuple[torch.Tensor, ...]) -> None:
+            """Record the embedding allocation's sequence size.
+
+            Args:
+                module: Embedding under test.
+                args: Raw integer IDs [batch, local_sequence] in args[0].
+            """
+            embedding_lengths.append(args[0].shape[1])
+
+        def record_vision(module: torch.nn.Module, args: tuple[torch.Tensor, ...]) -> None:
+            """Record actual patch rows entering the real vision tower.
+
+            Args:
+                module: Vision tower under test.
+                args: Pixel rows [local_patches, patch_width] in args[0].
+            """
+            vision_patch_rows.append(args[0].shape[0])
+
+        model.model.language_model.embed_tokens.register_forward_pre_hook(record_embedding)
+        model.model.visual.register_forward_pre_hook(record_vision)
         ddp = DistributedDataParallel(model)
         reference.load_state_dict(model.state_dict())
         optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
         reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.01)
-        for packed, accumulation in ((False, 1), (True, 2), (True, 1)):
+        for scenario, packed, accumulation in (
+            ("image", False, 1),
+            ("mixed", True, 2),
+            ("text_tail", True, 1),
+            ("text_only", False, 1),
+        ):
             for microstep in range(accumulation):
                 all_batches = []
                 for dp_rank in range(world_size // 2):
                     docs = _documents()
                     docs[0]["pixel_values"] = docs[0]["pixel_values"] + dp_rank * 0.2 + microstep * 0.1
+                    if scenario == "text_tail":
+                        docs = [docs[0], {"input_ids": torch.tensor([[6, 7, 8, 9, 10] * 6])}]
+                    if scenario == "text_only":
+                        # Different DP groups may contain media or text-only samples.
+                        docs = [docs[2]] if dp_rank == 0 else docs[:1]
                     all_batches.append(_pack(docs) if packed else docs[0])
                 batch = all_batches[rank // 2]
                 labels = batch["input_ids"].clone()
@@ -169,10 +248,26 @@ def _cp_worker(rank: int, world_size: int, rendezvous: str) -> None:
                 _, local, _ = hook.shard_batch(cp_mesh, None, local)
                 context = local["_qwen3_8_flash_next_cp_context"]
                 sync = ddp.no_sync() if microstep + 1 < accumulation else contextlib.nullcontext()
-                with sync:
+                token = set_cp_vision_group(
+                    cp_mesh.get_group(),
+                    config=CpVisionFrameShardingConfig(
+                        enabled=frame_sharding,
+                        min_tokens=0,
+                        min_local_patch_rows=0,
+                    ),
+                )
+                embedding_lengths.clear()
+                vision_patch_rows.clear()
+                with sync, contextlib.ExitStack() as stack:
+                    stack.callback(reset_cp_vision_group, token)
                     actual = ddp(**local).logits
+                    assert embedding_lengths == [context.local_sequence_length]
+                    if frame_sharding and scenario == "mixed":
+                        assert vision_patch_rows == [32]  # 64 global rows split over CP2.
+                    if frame_sharding and scenario in ("image", "text_tail"):
+                        assert vision_patch_rows == ([32] if rank % 2 == 0 else [4])  # One real frame + one dummy.
                     start = context.local_sequence_start
-                    count = min(context.local_sequence_length, labels.shape[1] - start)
+                    count = max(0, min(context.local_sequence_length, labels.shape[1] - start))
                     torch.testing.assert_close(
                         actual[:, :count], full_logits[:, start : start + count], atol=2e-6, rtol=2e-5
                     )
@@ -237,12 +332,13 @@ def test_dataset_packer_shift_and_mrope_match_individual_losses() -> None:
 
 
 @pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("frame_sharding", [False, True])
 @pytest.mark.runtime_budget(
     60, hard_timeout=90, reason="Real CP2 and DP2xCP2 workers compare hybrid-model gradients and updates"
 )
-def test_cp_and_dp_cp_media_gradients_norm_and_step(tmp_path: Path, world_size: int) -> None:
+def test_cp_and_dp_cp_media_gradients_norm_and_step(tmp_path: Path, world_size: int, frame_sharding: bool) -> None:
     torch.multiprocessing.spawn(
-        _cp_worker, args=(world_size, (tmp_path / "rdzv").as_uri()), nprocs=world_size, join=True
+        _cp_worker, args=(world_size, (tmp_path / "rdzv").as_uri(), frame_sharding), nprocs=world_size, join=True
     )
 
 
@@ -273,12 +369,15 @@ def test_cp_packing_recipe_resolves_typed_pipeline_and_capabilities() -> None:
 
     from nemo_automodel._transformers.capabilities import ModelSupports
     from nemo_automodel.components.config.loader import ConfigNode
+    from nemo_automodel.recipes._dist_utils import parse_distributed_section
     from nemo_automodel.recipes._typed_config import RecipeConfig
 
     path = Path(__file__).resolve().parents[4] / (
         "examples/vlm_finetune/qwen3_8_flash_next/qwen3_8_flash_next_180b_medpix_packed4k_cp2_ep64.yaml"
     )
     raw = yaml.safe_load(path.read_text())
+    policy = parse_distributed_section(raw["distributed"])["strategy_config"].multimodal.vision.frame_sharding
+    assert policy.enabled and policy.mesh_dims == ("cp",)
     # Resolve the real input-pipeline factories without constructing the 180B
     # model, downloading media, or importing the optional CUDA optimizer.
     cfg = RecipeConfig(
@@ -308,6 +407,10 @@ def test_cp_packing_recipe_resolves_typed_pipeline_and_capabilities() -> None:
     capabilities = ModelSupports(model, SimpleNamespace(cp_size=2, tp_size=1, pp_size=1, ep_size=64))
     assert capabilities.supports_cp
     assert capabilities.supports_cp_with_sequence_packing
+    assert capabilities.supports_cp_vision_frame_sharding
+    text_config = _config()
+    text_config.language_model_only = True
+    assert not Qwen3_8_FlashNextForConditionalGeneration.get_capabilities(text_config).supports_cp_vision_frame_sharding
 
 
 def test_packed_gdn_cuda_dispatch_without_conv_kernel_preserves_documents(monkeypatch: pytest.MonkeyPatch) -> None:

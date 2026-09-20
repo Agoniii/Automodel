@@ -25,6 +25,7 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
 from nemo_automodel.components.distributed.context_parallel.sharder import ShardLayout
+from nemo_automodel.components.distributed.cp_vision_frame_shard import maybe_distribute_visual
 from nemo_automodel.components.models.qwen3_8_flash_next.config import Qwen3_8_FlashNextConfig
 from nemo_automodel.shared.import_utils import safe_import
 
@@ -290,24 +291,35 @@ class Qwen3_8_FlashNextMultimodalMixin:
         pixel_values_videos: torch.Tensor | None,
         image_grid_thw: torch.Tensor | None,
         video_grid_thw: torch.Tensor | None,
+        sequence_start: int = 0,
     ) -> torch.Tensor:
         """Encode both modalities in one tower call and splice their features.
 
         Args:
-            input_ids: Original tokenizer IDs [batch, sequence].
-            inputs_embeds: Token embeddings [batch, sequence, hidden].
+            input_ids: Global original tokenizer IDs [batch, global_sequence].
+            inputs_embeds: Local token embeddings [batch, local_sequence, hidden].
+                Without CP, local_sequence equals global_sequence.
             pixel_values: Flattened image patches [patches, channels * temporal_patch
                 * patch_height * patch_width], in processor order.
             pixel_values_videos: Video patches with the same flattened layout.
             image_grid_thw: Integer image patch grids [images, 3], in token order.
             video_grid_thw: Integer video patch grids [videos, 3], in token order.
+            sequence_start: Inclusive global token offset of the local embedding
+                slice. The same interval is selected from every batch row.
 
         Returns:
-            Embeddings [batch, sequence, hidden]; with media, a new tensor whose
-            gradient flows into the vision tower and merger.
+            Embeddings [batch, local_sequence, hidden]; with media, a new tensor
+            whose gradient flows into the vision tower and merger. No global
+            [batch, global_sequence, hidden] embedding buffer is constructed.
         """
         if self.visual is None:
             raise ValueError("Image/video inputs require language_model_only=False")
+        sequence_end = sequence_start + inputs_embeds.shape[1]
+        if (
+            inputs_embeds.shape[0] != input_ids.shape[0]
+            or not 0 <= sequence_start <= sequence_end <= input_ids.shape[1]
+        ):
+            raise ValueError("Local embeddings must describe a valid sequence slice of the global input_ids")
         vision = self.config.vision_config
         merge = vision.spatial_merge_size
         patch_width = vision.in_channels * vision.temporal_patch_size * vision.patch_size**2
@@ -345,10 +357,23 @@ class Qwen3_8_FlashNextMultimodalMixin:
             # including text-only ranks. The zero edge also runs its backward.
             patches.append(inputs_embeds.new_zeros((merge**2, patch_width), dtype=self.visual.dtype))
             grids.append(input_ids.new_tensor([[1, merge, merge]]))
-        features = self.visual(torch.cat(patches), grid_thw=torch.cat(grids), return_dict=True).pooler_output
+        # The recipe publishes a CP-only group for this generic, opt-in policy.
+        # Its differentiable gather routes gradients to each frame's compute rank.
+        features = maybe_distribute_visual(self.visual, torch.cat(patches), torch.cat(grids)).pooler_output
         features = features.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
         if not counts:
             return inputs_embeds + features.sum() * 0
         for mask, media_features in zip(masks, features.split(counts), strict=True):
-            inputs_embeds = inputs_embeds.masked_scatter(mask.unsqueeze(-1).expand_as(inputs_embeds), media_features)
+            local_mask = mask[:, sequence_start:sequence_end]
+            if sequence_start != 0 or sequence_end != input_ids.shape[1]:
+                # Feature rows follow row-major placeholder order across the
+                # entire batch, not just within an individual sample or rank.
+                feature_rows = mask.flatten().long().cumsum(0).view_as(mask) - 1
+                local_rows = feature_rows[:, sequence_start:sequence_end][local_mask]
+                media_features = media_features[local_rows]
+            # Keep the empty source in the graph too: ranks without local media
+            # must still participate in vision gather/FSDP backward collectives.
+            inputs_embeds = inputs_embeds.masked_scatter(
+                local_mask.unsqueeze(-1).expand_as(inputs_embeds), media_features
+            )
         return inputs_embeds

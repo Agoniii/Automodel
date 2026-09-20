@@ -16,7 +16,8 @@
 # QSA indexers remain frozen. Requires the vlm-media extra and a multi-node
 # CUDA image with the same FlexAttention/FLA/EP dependencies as the text recipe.
 # Hardware target: 8 nodes x 8 GPUs, EP64, CP2, TP=PP=1, packed 4K tokens.
-# Vision is replicated within each CP group; the decoder sequence is sharded.
+# Vision frame work and decoder sequences are partitioned across each CP group.
+# Text embeddings are constructed locally; merged vision features are gathered.
 # CP/packing numerical parity is CPU-tested; full CUDA/EP64 VLM is unvalidated.
 # Full-checkpoint distributed VLM convergence has not yet been validated.
 # Launch through the existing multi-node launcher with this YAML as CONFIG.
@@ -79,6 +80,12 @@ distributed:
   ep_size: 64
   sequence_parallel: false
   activation_checkpointing: true
+  multimodal:
+    vision:
+      frame_sharding:
+        enabled: true
+        mesh_dims: [cp]
+        min_tokens: 0
   moe:
     reshard_after_forward: true
     wrap_outer_model: true
