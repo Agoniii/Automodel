@@ -161,12 +161,12 @@ def _freqs(sequence_length: int) -> torch.Tensor:
 def test_model_advertises_and_returns_its_contiguous_cp_sharder() -> None:
     model = object.__new__(Qwen3_8_FlashNextForConditionalGeneration)
     nn.Module.__init__(model)
-    model.config = SimpleNamespace(text_config=SimpleNamespace(indexer_compress_ratio=4))
+    model.config = SimpleNamespace(language_model_only=True, text_config=SimpleNamespace(indexer_compress_ratio=4))
 
     prepared = model.prepare_model_inputs_for_cp({}, num_chunks=1)
 
     assert Qwen3_8_FlashNextForConditionalGeneration._owns_cp_attention is True
-    assert Qwen3_8_FlashNextForConditionalGeneration.ModelCapabilities.supports_cp is True
+    assert Qwen3_8_FlashNextForConditionalGeneration.get_capabilities(model.config).supports_cp is True
     assert set(prepared) == {"cp_sharder"}
     sharder = prepared["cp_sharder"]
     assert isinstance(sharder, ContextParallelSharder)

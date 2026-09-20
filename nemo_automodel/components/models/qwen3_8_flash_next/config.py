@@ -16,9 +16,12 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from transformers.configuration_utils import PretrainedConfig
+
+if TYPE_CHECKING:
+    from torch import nn
 
 
 class Qwen3_8_FlashNextTextConfig(PretrainedConfig):
@@ -297,6 +300,38 @@ class Qwen3_8_FlashNextVisionConfig(PretrainedConfig):
         self.spatial_merge_size = spatial_merge_size
         self.temporal_patch_size = temporal_patch_size
         self.deepstack_visual_indexes = [] if deepstack_visual_indexes is None else list(deepstack_visual_indexes)
+
+    def build(self) -> nn.Module:
+        """Construct the checkpoint's Qwen3-VL vision tower and patch merger.
+
+        Returns:
+            Qwen3-VL vision module with SDPA attention. Its merged output width
+            is ``out_hidden_size``; the caller owns placement and precision.
+        """
+        from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
+
+        from nemo_automodel.shared.import_utils import safe_import
+
+        _, modeling = safe_import("transformers.models.qwen3_vl.modeling_qwen3_vl")
+        if self.deepstack_visual_indexes:
+            raise ValueError("Qwen3.8-Flash-Next checkpoints require an empty deepstack_visual_indexes list")
+        config = Qwen3VLVisionConfig(
+            depth=self.depth,
+            hidden_act=self.hidden_act,
+            hidden_size=self.hidden_size,
+            in_channels=self.in_channels,
+            initializer_range=self.initializer_range,
+            intermediate_size=self.intermediate_size,
+            num_heads=self.num_heads,
+            num_position_embeddings=self.num_position_embeddings,
+            out_hidden_size=self.out_hidden_size,
+            patch_size=self.patch_size,
+            spatial_merge_size=self.spatial_merge_size,
+            temporal_patch_size=self.temporal_patch_size,
+            deepstack_visual_indexes=[],
+            attn_implementation="sdpa",
+        )
+        return modeling.Qwen3VLVisionModel(config)
 
 
 class Qwen3_8_FlashNextConfig(PretrainedConfig):

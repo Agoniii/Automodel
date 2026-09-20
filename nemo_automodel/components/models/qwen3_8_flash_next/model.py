@@ -17,8 +17,9 @@
 This implementation uses the checkpoint's compressed-block QSA router and a
 FlexAttention sparse-GQA path for CUDA BF16 long-sequence SFT, with a PyTorch
 oracle for CPU and numerical parity. Pipeline and tensor parallelism remain
-unsupported. Context parallelism uses a model-owned contiguous sequence shard
-for QSA, GDN, and PLE, and composes with sequence packing.
+unsupported. Text-only context parallelism uses a model-owned contiguous
+sequence shard for QSA, GDN, and PLE, and composes with sequence packing.
+Image/video training uses CP=1 without packing.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 
+from nemo_automodel._transformers.model_capabilities import ModelCapabilities
 from nemo_automodel.components.distributed.context_parallel.sharder import (
     ContextParallelSharder,
     contiguous_local_indices,
@@ -63,6 +65,7 @@ from .engram import (
     Qwen3_8_FlashNextPLELayer,
 )
 from .layers import Qwen3_8_FlashNextDecoderLayer, Qwen3_8_FlashNextHyperConnection
+from .multimodal import Qwen3_8_FlashNextMultimodalMixin
 from .state_dict_adapter import Qwen3_8_FlashNextStateDictAdapter
 
 
@@ -411,8 +414,8 @@ class Qwen3_8_FlashNextTextModelBackend(nn.Module):
         self.hyper_connection_mixer.init_weights(init_std=self.config.initializer_range)
 
 
-class Qwen3_8_FlashNextModel(nn.Module):
-    """Language-only Qwen3.8-Flash-Next decoder wrapper."""
+class Qwen3_8_FlashNextModel(Qwen3_8_FlashNextMultimodalMixin, nn.Module):
+    """Qwen3.8-Flash-Next vision tower and HC decoder wrapper."""
 
     def __init__(
         self,
@@ -426,6 +429,14 @@ class Qwen3_8_FlashNextModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.visual = None
+        if not config.language_model_only:
+            if config.vision_config.out_hidden_size != config.text_config.hidden_size:
+                raise ValueError("vision_config.out_hidden_size must equal text_config.hidden_size")
+            self.visual = config.vision_config.build()
+            # Honor fp32 rotary buffers during construction and later model casts.
+            self.visual._keep_in_fp32_modules = ["rotary_pos_emb"]
+            cast_model_to_dtype(self.visual, _resolve_model_dtype(config.text_config))
         self.language_model = Qwen3_8_FlashNextTextModelBackend(
             config.text_config,
             backend,
@@ -444,10 +455,15 @@ class Qwen3_8_FlashNextModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         past_key_values: object | None = None,
         output_hidden_states: bool | None = None,
+        pixel_values: torch.Tensor | None = None,
+        pixel_values_videos: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
+        video_grid_thw: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
         _qwen3_8_flash_next_cp_context: Qwen3_8_FlashNextCPContext | None = None,
         **kwargs: Any,
     ) -> BaseModelOutputWithPast:
-        """Run the language-only Qwen3.8-Flash-Next decoder.
+        """Embed text and media, retaining raw IDs for the Engram decoder.
 
         Args:
             input_ids: Raw IDs of shape ``[batch, sequence]``; required for
@@ -460,6 +476,12 @@ class Qwen3_8_FlashNextModel(nn.Module):
                 ``[batch, sequence, hidden_size]``.
             past_key_values: Cache state; unsupported for training.
             output_hidden_states: Capture decoder HC states.
+            pixel_values: Image patches [image_patches, flattened_patch_width].
+            pixel_values_videos: Video patches [video_patches, flattened_patch_width].
+                Patch width is channels * temporal_patch_size * patch_size**2.
+            image_grid_thw: Image T/H/W patch grids [images, 3].
+            video_grid_thw: Video T/H/W patch grids [videos, 3].
+            mm_token_type_ids: Optional text/image/video IDs [batch, sequence].
             _qwen3_8_flash_next_cp_context: Internal contiguous CP metadata with replicated
                 raw-ID/padding tensors of shape ``[batch, global_sequence]``.
             **kwargs: Text-attention backend arguments.
@@ -468,6 +490,51 @@ class Qwen3_8_FlashNextModel(nn.Module):
             Base-model output whose final text states have shape
             ``[batch, sequence, hidden_size]``.
         """
+        has_media = pixel_values is not None or pixel_values_videos is not None
+        has_placeholders = input_ids is not None and bool(
+            ((input_ids == self.config.image_token_id) | (input_ids == self.config.video_token_id)).any()
+        )
+        if (
+            self.visual is not None
+            or has_media
+            or has_placeholders
+            or image_grid_thw is not None
+            or video_grid_thw is not None
+        ):
+            if input_ids is None:
+                raise ValueError("Raw input_ids are required for multimodal placeholder matching and Engram hashing")
+            if _qwen3_8_flash_next_cp_context is not None:
+                raise NotImplementedError("Qwen3.8-Flash-Next multimodal training requires cp_size=1")
+            packed_keys = (
+                "cu_seqlens",
+                "cu_seqlens_q",
+                "cu_seqlens_kv",
+                "cu_seqlens_padded",
+                "seq_lens",
+                "seq_lens_padded",
+            )
+            if any(kwargs.get(key) is not None for key in packed_keys) or kwargs.get("qkv_format") == "thd":
+                raise NotImplementedError("Qwen3.8-Flash-Next multimodal sequence packing is not supported")
+            if inputs_embeds is None:
+                inputs_embeds = self.language_model.embed_tokens(input_ids)
+            inputs_embeds = self._splice_vision_embeddings(
+                input_ids,
+                inputs_embeds,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+            )
+            if position_ids is None and has_media:
+                position_ids, _ = self.get_rope_index(
+                    input_ids, mm_token_type_ids, image_grid_thw, video_grid_thw, attention_mask
+                )
+            elif has_media and (
+                position_ids.ndim != 3
+                or position_ids.shape[0] not in (3, 4)
+                or position_ids.shape[1:] != input_ids.shape
+            ):
+                raise ValueError("Multimodal position_ids must have shape [3 or 4, batch, sequence]")
         return self.language_model(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
@@ -481,7 +548,7 @@ class Qwen3_8_FlashNextModel(nn.Module):
 
 
 class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
-    """Trainable language-only Qwen3.8-Flash-Next causal-LM wrapper."""
+    """Trainable Qwen3.8-Flash-Next text/image/video wrapper."""
 
     tie_word_embeddings_support: TieSupport = TieSupport.UNTIED_ONLY
     _keep_in_fp32_modules_strict = ["_fp32_params"]
@@ -490,15 +557,17 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
     # FlexAttention QSA path; other attention backends have no packed routing.
     _packed_cp_attn_backends = ("flex",)
 
-    @dataclass(frozen=True)
-    class ModelCapabilities:
-        """Validated distributed features for the QSA sparse-SFT path."""
+    @classmethod
+    def get_capabilities(cls, config: Qwen3_8_FlashNextConfig) -> ModelCapabilities:
+        """Keep context parallelism restricted to the text-only configuration."""
+        return ModelCapabilities(supports_cp=config.language_model_only, supports_ep=True)
 
-        supports_tp: bool = False
-        supports_cp: bool = True
-        supports_pp: bool = False
-        supports_ep: bool = True
-        supports_mtp_cp: bool = False
+    def get_model_layer_groups(self) -> dict[str, list[nn.Module]]:
+        """Expose decoder and vision blocks to FSDP and activation checkpointing."""
+        groups = {"language": list(self.model.language_model.layers.values())}
+        if self.model.visual is not None:
+            groups["vision"] = list(self.model.visual.blocks)
+        return groups
 
     @classmethod
     def from_config(
@@ -520,7 +589,6 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
     ) -> Qwen3_8_FlashNextForConditionalGeneration:
         """Construct architecture from a local/HF config before checkpoint load."""
         config = Qwen3_8_FlashNextConfig.from_pretrained(pretrained_model_name_or_path)
-        config.language_model_only = True
         return cls.from_config(config, *model_args, **kwargs)
 
     def __init__(
@@ -534,11 +602,6 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
         **kwargs: Any,
     ) -> None:
         reject_unsupported_tie_word_embeddings(type(self), config)
-        if not config.language_model_only:
-            raise NotImplementedError(
-                "Qwen3.8-Flash-Next AutoModel support is currently language-only; set "
-                "config.language_model_only=True. Vision and video training have not been validated."
-            )
         super().__init__()
         moe_overrides = kwargs.pop("moe_overrides", None)
         if kwargs:
@@ -569,6 +632,7 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
         keep_fp32 = list(getattr(self, "_keep_in_fp32_modules", None) or [])
         if "_fp32_params" not in keep_fp32:
             keep_fp32.append("_fp32_params")
+        keep_fp32.append("rotary_pos_emb")
         self._keep_in_fp32_modules = keep_fp32
 
         if self.backend.enable_hf_state_dict_adapter:
@@ -644,6 +708,11 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
             returns local contiguous token tensors of shape ``[batch,
             padded_global_sequence / cp_size, ...]``.
         """
+        if not self.config.language_model_only or any(
+            batch.get(key) is not None
+            for key in ("pixel_values", "pixel_values_videos", "image_grid_thw", "video_grid_thw")
+        ):
+            raise NotImplementedError("Qwen3.8-Flash-Next multimodal training requires cp_size=1")
         del batch, num_chunks
         return {
             "cp_sharder": ContextParallelSharder(
@@ -666,10 +735,15 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
         use_cache: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         output_hidden_states: bool | None = None,
+        pixel_values: torch.Tensor | None = None,
+        pixel_values_videos: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
+        video_grid_thw: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
         _qwen3_8_flash_next_cp_context: Qwen3_8_FlashNextCPContext | None = None,
         **kwargs: Any,
     ) -> Qwen3_8_FlashNextCausalLMOutput:
-        """Run language-only generation and project final HC-mixed states.
+        """Run text/image/video training and project final HC-mixed states.
 
         Args:
             input_ids: Raw tokenizer IDs of shape ``[batch, sequence]``.
@@ -691,6 +765,12 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
                 ``config.output_hidden_states=True`` returns only the final
                 state for fused linear cross entropy without retaining every
                 decoder activation.
+            pixel_values: Image patches [image_patches, flattened_patch_width].
+            pixel_values_videos: Video patches [video_patches, flattened_patch_width].
+                Patch width is channels * temporal_patch_size * patch_size**2.
+            image_grid_thw: Image T/H/W patch grids [images, 3].
+            video_grid_thw: Video T/H/W patch grids [videos, 3].
+            mm_token_type_ids: Optional text/image/video IDs [batch, sequence].
             _qwen3_8_flash_next_cp_context: Internal contiguous CP metadata with replicated
                 raw-ID/padding tensors of shape ``[batch, global_sequence]``.
             **kwargs: Text-attention backend metadata.
@@ -713,6 +793,11 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
             inputs_embeds=inputs_embeds,
             past_key_values=past_key_values,
             output_hidden_states=capture_all_hidden_states,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            mm_token_type_ids=mm_token_type_ids,
             _qwen3_8_flash_next_cp_context=_qwen3_8_flash_next_cp_context,
             **kwargs,
         )
@@ -745,6 +830,9 @@ class Qwen3_8_FlashNextForConditionalGeneration(HFCheckpointingMixin, nn.Module,
                 torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
             )
         self.model.language_model.init_weights(buffer_device)
+        if self.model.visual is not None:
+            # Explicitly reinitialize after to_empty/meta materialization, too.
+            self.model.visual.apply(self.model.visual._init_weights)
         std = self.config.text_config.hidden_size**-0.5
         nn.init.trunc_normal_(self.lm_head.weight, mean=0.0, std=std, a=-3 * std, b=3 * std)
         cast_model_to_dtype(self, dtype, skip_modules=("_fp32_params",))

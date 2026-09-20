@@ -44,6 +44,7 @@ from nemo_automodel.components.models.qwen3_8_flash_next.qsa import (
 )
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention
 from nemo_automodel.components.moe.layers import MoE
+from nemo_automodel.shared.import_utils import safe_import_from
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 
@@ -136,6 +137,11 @@ class Qwen3_8_FlashNextGatedDeltaNet(CPAwareGatedDeltaNet):
 
     def __init__(self, config: object, layer_idx: int) -> None:
         super().__init__(config, layer_idx)
+        # The inherited non-CP path calls the CUDA package's ``x=`` API.
+        # Transformers 5.15's fallback instead requires ``hidden_states``;
+        # select the existing torch convolution branch when the package is absent.
+        has_conv, conv_fn = safe_import_from("causal_conv1d", "causal_conv1d_fn")
+        self.causal_conv1d_fn = conv_fn if has_conv else None
         output_gate_type = str(getattr(config, "output_gate_type", "sigmoid"))
         self._packed_global_cu_seqlens: torch.Tensor | None = None
         self.norm = Qwen3_8_FlashNextRMSNormGated(

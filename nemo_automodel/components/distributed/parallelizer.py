@@ -2103,6 +2103,9 @@ def _get_model_layer_group_specs() -> Dict[Any, Dict[str, List[str]]]:
 
 def _extract_model_layer_groups(model: nn.Module) -> Dict[str, List[nn.Module]]:
     """Extract transformer layers grouped by model role."""
+    layer_group_hook = getattr(type(model), "get_model_layer_groups", None)
+    if callable(layer_group_hook):
+        return layer_group_hook(model)
     model_cls = type(model)
     if model_cls.__name__ in {"BiEncoderModel", "CrossEncoderModel", "FSDPBiEncoderModel"}:
         inner_model = getattr(model, "model", None)

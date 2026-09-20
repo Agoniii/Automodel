@@ -1,14 +1,16 @@
 ---
 title: "Qwen3.8-Flash-Next"
-description: "Fine-tune the language-only Qwen3.8-Flash-Next Engram MoE checkpoint with FSDP2, expert parallelism, and context parallelism."
+description: "Fine-tune Qwen3.8-Flash-Next text and image/video inputs, with context parallelism available for text-only training."
 slug: model-coverage/large-language-models/qwen/qwen3-8-flash-next
 ---
 
 Qwen3.8-Flash-Next is a hybrid-attention Mixture-of-Experts (MoE) model with four
 persistent HyperConnection streams and an Engram N-gram Embedding table (named
-`ple` in the checkpoint configuration). NeMo AutoModel supports the language-only
-`Qwen3_8_FlashNextForConditionalGeneration` path for supervised fine-tuning
-(SFT). All backbone parameters are trainable except the QSA indexers, whose
+`ple` in the checkpoint configuration). NeMo AutoModel supports
+`Qwen3_8_FlashNextForConditionalGeneration` for text and image/video supervised
+fine-tuning (SFT). Set `language_model_only: true` for the original text-only
+path, or `false` to construct the checkpoint's Qwen3-VL vision tower and merger.
+All backbone and vision parameters are trainable except the QSA indexers, whose
 reference path exposes discrete top-k IDs but no auxiliary loss or
 straight-through gradient.
 
@@ -16,7 +18,7 @@ straight-through gradient.
 
 | | |
 |---|---|
-| **Task** | Text generation (MoE, hybrid attention, Engram N-gram Embedding) |
+| **Task** | Image/video understanding and text generation (MoE, hybrid attention, Engram N-gram Embedding) |
 | **Architecture** | `Qwen3_8_FlashNextForConditionalGeneration` |
 | **Parameters** | 125B backbone with 6B activated per token, plus the 51.2B Engram table; the checkpoint's 4B MTP head is not loaded |
 | **Decoder** | 48 layers: 36 GatedDeltaNet and 12 QSA sparse-attention layers |
@@ -41,7 +43,7 @@ straight-through gradient.
 - The final learned HyperConnection read collapses four 2,560-wide streams to
   one 2,560-wide state before the untied language-model head.
 
-## Validated Configuration
+## Validated Text-Only Configuration
 
 | Area | Validated Configuration |
 |---|---|
@@ -123,6 +125,30 @@ setup.
 
 ## Current Scope
 
+- Image/video inputs use `pixel_values` / `pixel_values_videos` and
+  `image_grid_thw` / `video_grid_thw` from `Qwen3VLProcessor`. The merger
+  output replaces media placeholder embeddings, while original tokenizer IDs
+  remain available to Engram hashing. mRoPE uses the Qwen3-VL image-grid and
+  timestamped-video position rules; callers supplying positions must supply
+  three T/H/W axes (or four axes with the leading text positions).
+- Multimodal training currently requires TP=PP=CP=1 and no sequence packing.
+  It accepts mixed image/video/text batches with right-tail padding. Vision
+  parameters retain `model.visual.*` checkpoint names and use SDPA separately
+  from the language decoder's FlexAttention QSA backend. Nonempty DeepStack
+  configurations are rejected; the released checkpoint has no DeepStack layers.
+- The candidate
+  [multimodal EP64 recipe](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/qwen3_8_flash_next/qwen3_8_flash_next_180b_medpix_ep64.yaml)
+  trains both the vision tower and language model on MedPix-VQA. Install the
+  `vlm-media` extra for the processor. The distributed convergence results above
+  apply only to text: full-checkpoint distributed multimodal convergence and
+  CUDA memory/performance require separate validation.
+- CPU numerical tests cover real image/video processing through collated SFT
+  loss and optimizer updates, vision outputs/gradients against Transformers,
+  hybrid GDN/QSA backpropagation, activation recomputation, checkpoint round
+  trips, and two-rank DDP gradient parity with a serial reference. The latter
+  uses tiny replicated parameters; it does not validate EP64/FSDP2 collectives
+  or the full checkpoint.
+
 - QSA uses FlexAttention sparse GQA for CUDA BF16 training when
   `model.backend.attn=flex`. Route IDs are scattered into a boolean membership
   table of shape `[batch, queries, key/value tokens]` and executed through a
@@ -151,8 +177,8 @@ setup.
   right-tail-padded batches and packed (THD) batches with `cu_seqlens` (or
   loader `seq_lens`) are both supported; the same FlexAttention path serves
   packed CUDA training, and packing is performed topology-independently.
-  Left padding, interior padding, TP, PP, MTP, and vision and video training
-  remain unsupported.
+  Left padding, interior padding, TP, PP, and MTP remain unsupported.
+  Vision/video inputs are supported only without CP or sequence packing.
 
 ## References
 

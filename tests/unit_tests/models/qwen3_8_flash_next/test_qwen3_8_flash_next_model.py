@@ -100,11 +100,11 @@ def test_model_class_alias_selects_qwen3_8_flash_next_conditional_generation() -
     assert ModelClass is Qwen3_8_FlashNextForConditionalGeneration
 
 
-def test_multimodal_configuration_fails_closed() -> None:
+def test_multimodal_configuration_validates_projector_width() -> None:
     config = _tiny_config()
     config.language_model_only = False
 
-    with pytest.raises(NotImplementedError, match="currently language-only"):
+    with pytest.raises(ValueError, match="out_hidden_size"):
         Qwen3_8_FlashNextForConditionalGeneration.from_config(
             config,
             moe_config=_tiny_moe_config(config.text_config),
