@@ -14,6 +14,7 @@
 
 """CPU tests for the exact Qwen3.8-Flash-Next HyperConnection equations."""
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -133,3 +134,74 @@ def test_hyperconnection_preserves_fp32_residual_with_bf16_projections() -> None
     for parameter in layer.parameters():
         assert parameter.grad is not None and parameter.grad.dtype == parameter.dtype
         assert torch.isfinite(parameter.grad).all()
+
+
+def _hc_layer(dtype: torch.dtype, **backend_overrides) -> Qwen3_8_FlashNextHyperConnection:
+    torch.manual_seed(5)
+    layer = Qwen3_8_FlashNextHyperConnection(
+        hidden_size=4,
+        hc_count=3,
+        lowrank_size=5,
+        rms_norm_eps=1e-6,
+        backend=BackendConfig(linear="torch", **backend_overrides),
+        dtype=dtype,
+    )
+    for parameter in layer.parameters():
+        parameter.detach().uniform_(-0.25, 0.25)
+    return layer
+
+
+def test_compile_hc_requires_torch_linear() -> None:
+    with pytest.raises(ValueError, match="compile_hc"):
+        Qwen3_8_FlashNextHyperConnection(
+            hidden_size=4,
+            hc_count=2,
+            lowrank_size=3,
+            rms_norm_eps=1e-6,
+            backend=BackendConfig(linear="te", compile_hc=True),
+            dtype=torch.float32,
+        )
+
+
+@pytest.mark.runtime_budget(
+    90,
+    hard_timeout=300,
+    reason="two inductor CPU compilations (read and write gate chains) plus their backward graphs",
+)
+def test_compile_hc_matches_eager_read_write_and_gradients() -> None:
+    """compile_hc keeps mix/combine outputs, dtypes and every gradient allclose to the eager chain."""
+    eager = _hc_layer(torch.float32)
+    compiled = _hc_layer(torch.float32, compile_hc=True)
+    compiled.load_state_dict(eager.state_dict())
+    assert compiled.compile_gates and not eager.compile_gates
+
+    torch.manual_seed(3)
+    x = torch.randn(2, 3, 12)
+    block_output = torch.randn(2, 3, 4)
+    results = []
+    for layer in (eager, compiled):
+        x_run = x.clone().requires_grad_(True)
+        block_run = block_output.clone().requires_grad_(True)
+        mixed, residual = layer.mix(x_run)
+        combined = layer.combine(block_run, residual)
+        (mixed.square().mean() + combined.square().mean()).backward()
+        results.append(
+            (
+                mixed.detach(),
+                combined.detach(),
+                x_run.grad.clone(),
+                block_run.grad.clone(),
+                {name: p.grad.clone() for name, p in layer.named_parameters()},
+            )
+        )
+    (e_mixed, e_combined, e_x_grad, e_block_grad, e_grads), (c_mixed, c_combined, c_x_grad, c_block_grad, c_grads) = (
+        results
+    )
+    assert c_mixed.dtype == e_mixed.dtype and c_combined.dtype == e_combined.dtype
+    torch.testing.assert_close(c_mixed, e_mixed, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(c_combined, e_combined, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(c_x_grad, e_x_grad, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(c_block_grad, e_block_grad, rtol=1e-5, atol=1e-6)
+    assert c_grads.keys() == e_grads.keys()
+    for name in e_grads:
+        torch.testing.assert_close(c_grads[name], e_grads[name], rtol=1e-5, atol=1e-6, msg=name)

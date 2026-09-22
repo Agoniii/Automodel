@@ -86,10 +86,55 @@ def _grouped_rms_norm_fp32(
     return (normalized * (1.0 + weight.float())).to(input_dtype)
 
 
+def _hc_read_gate_mix(
+    normalized: torch.Tensor,
+    down_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    hc_count: int,
+    hidden_size: int,
+) -> torch.Tensor:
+    """HyperConnection read: low-rank gate prediction and gated stream mean as one fusable chain.
+
+    Mirrors :meth:`Qwen3_8_FlashNextHyperConnection.mix` for plain ``nn.Linear`` projections so
+    the whole chain can be handed to ``torch.compile`` (``BackendConfig.compile_hc``).
+    """
+    projection_input = normalized.to(dtype=down_weight.dtype)
+    gates = F.silu(F.linear(projection_input, down_weight) / hc_count)
+    gates = torch.sigmoid(F.linear(gates, up_weight))
+    return (gates.unflatten(-1, (hc_count, hidden_size)) * normalized.unflatten(-1, (hc_count, hidden_size))).mean(
+        dim=-2
+    )
+
+
+def _hc_write_back(
+    hidden_states: torch.Tensor,
+    normalized: torch.Tensor,
+    block_output: torch.Tensor,
+    inject_weight: torch.Tensor,
+    hc_count: int,
+    hidden_size: int,
+) -> torch.Tensor:
+    """HyperConnection write: per-stream injection gate and residual update as one fusable chain.
+
+    Mirrors :meth:`Qwen3_8_FlashNextHyperConnection.combine` for a plain ``nn.Linear`` injection
+    projection so the whole chain can be handed to ``torch.compile`` (``BackendConfig.compile_hc``).
+    """
+    projection_input = normalized.to(dtype=inject_weight.dtype)
+    injection_gate = 2.0 * torch.sigmoid(F.linear(projection_input, inject_weight) / hc_count)
+    streams = hidden_states.unflatten(-1, (hc_count, hidden_size))
+    injection = block_output.unsqueeze(-2) * injection_gate.unsqueeze(-1)
+    return (streams + injection).flatten(-2)
+
+
 # Compiled variants are used on CUDA only; CPU tests and the numerical oracle
 # keep the eager chain so they run without inductor warm-up.
 _rms_norm_gated_fp32_compiled = torch.compile(_rms_norm_gated_fp32, dynamic=True)
 _grouped_rms_norm_fp32_compiled = torch.compile(_grouped_rms_norm_fp32, dynamic=True)
+# Opt-in (BackendConfig.compile_hc): the HC gate chains are otherwise ~11 eager elementwise
+# launches per read/write, repeated for two HyperConnections per decoder layer and again on
+# activation-checkpoint recompute.
+_hc_read_gate_mix_compiled = torch.compile(_hc_read_gate_mix, dynamic=True)
+_hc_write_back_compiled = torch.compile(_hc_write_back, dynamic=True)
 
 
 class Qwen3_8_FlashNextRMSNormGated(nn.Module):
@@ -351,6 +396,12 @@ class Qwen3_8_FlashNextHyperConnection(nn.Module):
         self.flat_hidden_size = hidden_size * hc_count
         self.lowrank_size = lowrank_size
         self.use_combine = use_combine
+        self.compile_gates = bool(getattr(backend, "compile_hc", False))
+        if self.compile_gates and backend.linear != "torch":
+            raise ValueError(
+                "BackendConfig.compile_hc compiles the HyperConnection gate chains around plain nn.Linear "
+                f"projections and requires linear='torch'; got linear={backend.linear!r}"
+            )
         parameter_dtype = get_dtype(dtype, torch.bfloat16)
 
         self.hc_norm = Qwen3_8_FlashNextGroupedRMSNorm(
@@ -399,6 +450,15 @@ class Qwen3_8_FlashNextHyperConnection(nn.Module):
         if hidden_states.shape[-1] != self.flat_hidden_size:
             raise ValueError(f"Expected HC width {self.flat_hidden_size}, got {hidden_states.shape[-1]}")
         normalized = self.hc_norm(hidden_states)
+        if self.compile_gates:
+            mixed = _hc_read_gate_mix_compiled(
+                normalized,
+                self.input_mix_weight_down.weight,
+                self.input_mix_weight_up.weight,
+                self.hc_count,
+                self.hidden_size,
+            )
+            return mixed, Qwen3_8_FlashNextHyperConnectionResidual(hidden_states, normalized)
         # FSDP may keep the residual stream in fp32 while materializing the
         # projection weights in bf16 for compute. Match the projection dtype at
         # the linear boundary, then combine its gates with the original
@@ -436,6 +496,15 @@ class Qwen3_8_FlashNextHyperConnection(nn.Module):
             raise ValueError(f"Expected block output width {self.hidden_size}, got {block_output.shape[-1]}")
         if residual.hidden_states.shape[-1] != self.flat_hidden_size:
             raise ValueError(f"Expected residual width {self.flat_hidden_size}, got {residual.hidden_states.shape[-1]}")
+        if self.compile_gates:
+            return _hc_write_back_compiled(
+                residual.hidden_states,
+                residual.normalized_states,
+                block_output,
+                self.block_inject_weight.weight,
+                self.hc_count,
+                self.hidden_size,
+            )
         projection_input = residual.normalized_states.to(dtype=self.block_inject_weight.weight.dtype)
         injection_gate = 2.0 * torch.sigmoid(self.block_inject_weight(projection_input) / self.hc_count)
         streams = residual.hidden_states.unflatten(-1, (self.hc_count, self.hidden_size))

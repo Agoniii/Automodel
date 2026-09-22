@@ -526,6 +526,11 @@ class BackendConfig:
     # same lazy once-per-process pattern as compile_situ. Numerics are allclose to eager,
     # not bitwise-identical. Default False.
     compile_norm: bool = False
+    # When True, torch.compile the Qwen3.8-Flash-Next HyperConnection read/write gate chains
+    # (low-rank gate projections + silu/sigmoid + gated stream mean, and injection gate +
+    # residual update) as two free functions, in both the forward and the backward recompute.
+    # Requires linear="torch". Numerics are allclose to eager, not bitwise-identical. Default False.
+    compile_hc: bool = False
     # When True, models that opt in (currently Kimi K3) run their shared experts on a side CUDA
     # stream, launched before the routed-expert path and joined after it, so the shared-expert
     # GEMMs overlap the expert-parallel dispatch / combine communication (Megatron-Core's
