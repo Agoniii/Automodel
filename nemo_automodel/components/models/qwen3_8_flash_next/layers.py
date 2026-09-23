@@ -41,10 +41,15 @@ from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
     qwen3_8_flash_next_cp_all_gather,
 )
 from nemo_automodel.components.models.qwen3_8_flash_next.flex_qsa import build_flex_qsa_mask
-from nemo_automodel.components.models.qwen3_8_flash_next.hc_norm_triton import HAVE_TRITON, grouped_rms_norm_triton
+from nemo_automodel.components.models.qwen3_8_flash_next.hc_norm_triton import (
+    HAVE_TRITON,
+    grouped_rms_norm_triton,
+    rms_norm_gated_triton,
+)
 from nemo_automodel.components.models.qwen3_8_flash_next.qsa import (
     QSARouteSelection,
     Qwen3_8_FlashNextQSAIndexer,
+    Qwen3_8_FlashNextRMSNorm,
     current_qsa_route_replay,
     qsa_gqa_attention,
     qsa_route_replay_checkpoint_context_fn,
@@ -130,8 +135,12 @@ class Qwen3_8_FlashNextRMSNormGated(nn.Module):
         """
         # SGLang's layernorm_gated kernel keeps xhat*weight and gate multiply
         # in fp32 and casts only at the output store.
+        use_sigmoid = self.activation == "sigmoid"
+        if hidden_states.is_cuda and HAVE_TRITON:
+            # One fused kernel per direction (hc_norm_triton); same fp32 math as the chain below.
+            return rms_norm_gated_triton(hidden_states, gate, self.weight, self.variance_epsilon, use_sigmoid)
         norm_fn = _rms_norm_gated_fp32_compiled if hidden_states.is_cuda else _rms_norm_gated_fp32
-        return norm_fn(hidden_states, gate, self.weight, self.variance_epsilon, self.activation == "sigmoid")
+        return norm_fn(hidden_states, gate, self.weight, self.variance_epsilon, use_sigmoid)
 
     @torch.no_grad()
     def reset_parameters(self) -> None:
@@ -478,6 +487,9 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
         # copy, then discard the unused callable and retain the real backend.
         parent_backend = replace(backend, attn="sdpa")
         super().__init__(config, layer_idx, parent_backend)
+        # Same equation and state-dict keys as the inherited norms; fused kernel on CUDA.
+        self.q_norm = Qwen3_8_FlashNextRMSNorm(self.head_dim, eps=self.q_norm.eps)
+        self.k_norm = Qwen3_8_FlashNextRMSNorm(self.head_dim, eps=self.k_norm.eps)
         self.backend = backend
         self.attn_module = None
         self.attn_func = None

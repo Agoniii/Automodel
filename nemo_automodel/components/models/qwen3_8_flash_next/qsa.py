@@ -40,7 +40,31 @@ from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
     qwen3_8_flash_next_cp_all_gather,
 )
 from nemo_automodel.components.models.qwen3_8_flash_next.flex_qsa import FlexQSAMask, flex_sparse_gqa_attention
+from nemo_automodel.components.models.qwen3_8_flash_next.hc_norm_triton import HAVE_TRITON, grouped_rms_norm_triton
 from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextRMSNorm
+
+
+class Qwen3_8_FlashNextRMSNorm(Qwen3NextRMSNorm):
+    """Qwen3-Next RMSNorm (``(x * rsqrt(mean(x^2) + eps)) * (1 + w)`` in fp32) with a fused CUDA kernel.
+
+    Used for the QSA query/key norms and the indexer's query/key norms; the parameter
+    name and shape match the parent so checkpoints are unaffected.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalize the last axis.
+
+        Args:
+            x: Tensor of shape ``[..., dim]`` with arbitrary leading dims.
+
+        Returns:
+            Tensor of the same shape and dtype as ``x``.
+        """
+        if x.is_cuda and HAVE_TRITON:
+            return grouped_rms_norm_triton(x, self.weight, x.shape[-1], self.eps)
+        return super().forward(x)
+
+
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 # The gathered implementation is a numerical oracle and CPU fallback, not the
@@ -664,8 +688,8 @@ class Qwen3_8_FlashNextQSAIndexer(nn.Module):
             dtype=dtype,
         )
         eps = float(getattr(config, "rms_norm_eps"))
-        self.q_layernorm = Qwen3NextRMSNorm(self.head_dim, eps=eps)
-        self.k_layernorm = Qwen3NextRMSNorm(self.head_dim, eps=eps)
+        self.q_layernorm = Qwen3_8_FlashNextRMSNorm(self.head_dim, eps=eps)
+        self.k_layernorm = Qwen3_8_FlashNextRMSNorm(self.head_dim, eps=eps)
 
         # The supplied gold path emits discrete top-k IDs and contains no
         # indexer auxiliary loss or STE.  Make that training contract explicit
