@@ -34,7 +34,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from nemo_automodel.components.distributed.activation_checkpointing import unwrap_checkpoint_wrapper
 from nemo_automodel.components.distributed.blockdiag_cp import BlockdiagCpModelState
 from nemo_automodel.components.models.common import BackendConfig, initialize_linear_module
-from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb_qk
+from nemo_automodel.components.models.gpt_oss.rope_utils import apply_rotary_emb, apply_rotary_emb_qk
 from nemo_automodel.components.models.qwen3_5_moe.cp_linear_attn import CPAwareGatedDeltaNet
 from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
     Qwen3_8_FlashNextCPContext,
@@ -50,7 +50,7 @@ from nemo_automodel.components.models.qwen3_8_flash_next.qsa import (
     qsa_route_replay_checkpoint_context_fn,
     qsa_route_selection_region,
 )
-from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention
+from nemo_automodel.components.models.qwen3_next.layers import Qwen3NextAttention, Qwen3NextRMSNorm
 from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
@@ -460,6 +460,84 @@ class Qwen3_8_FlashNextHyperConnection(nn.Module):
             nn.init.trunc_normal_(self.block_inject_weight.weight, mean=0.0, std=init_std)
 
 
+def _rms_norm_one_plus(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Qwen3-Next RMSNorm equation: ``(x * rsqrt(mean(x^2) + eps)) * (1 + w)`` in fp32, cast back.
+
+    Args:
+        x: Tensor of shape ``[..., dim]``.
+        weight: Additive scale of shape ``[dim]``.
+        eps: Variance epsilon.
+
+    Returns:
+        Tensor of the same shape and dtype as ``x``.
+    """
+    normalized = x.float()
+    normalized = normalized * torch.rsqrt(normalized.pow(2).mean(-1, keepdim=True) + eps)
+    return (normalized * (1.0 + weight.float())).type_as(x)
+
+
+def _qsa_project_qkv(
+    x: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    eps: float,
+    freqs_cis: torch.Tensor,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """QSA pre-attention chain: q/k/v projections, gate split, fp32 q/k norms and RoPE.
+
+    Mirrors the module path of :class:`Qwen3_8_FlashNextQSAAttention.forward` for plain
+    ``nn.Linear`` projections so the whole chain can be handed to ``torch.compile``.
+
+    Args:
+        x: Block input of shape ``[batch, sequence, hidden]``.
+        q_weight: Query projection weight ``[heads * head_dim * 2, hidden]`` (query then gate halves per head).
+        k_weight: Key projection weight ``[kv_heads * head_dim, hidden]``.
+        v_weight: Value projection weight ``[kv_heads * head_dim, hidden]``.
+        q_norm_weight: Query norm additive scale ``[head_dim]``.
+        k_norm_weight: Key norm additive scale ``[head_dim]``.
+        eps: Norm epsilon.
+        freqs_cis: Rotary values ``[batch, sequence, rotary_dim]`` as concatenated cos and sin halves.
+        head_dim: Attention head width.
+
+    Returns:
+        ``(query, key, value, gate)`` with shapes ``[batch, sequence, heads, head_dim]``,
+        ``[batch, sequence, kv_heads, head_dim]`` (x2) and ``[batch, sequence, heads * head_dim]``.
+    """
+    batch_size, sequence_length, _ = x.shape
+    query = F.linear(x, q_weight).view(batch_size, sequence_length, -1, head_dim * 2)
+    key = F.linear(x, k_weight).view(batch_size, sequence_length, -1, head_dim)
+    value = F.linear(x, v_weight).view(batch_size, sequence_length, -1, head_dim)
+    query, gate = torch.chunk(query, 2, dim=-1)
+    gate = gate.reshape(batch_size, sequence_length, -1)
+    query = _rms_norm_one_plus(query, q_norm_weight, eps)
+    key = _rms_norm_one_plus(key, k_norm_weight, eps)
+    cos, sin = freqs_cis.split(freqs_cis.shape[-1] // 2, dim=-1)
+    return apply_rotary_emb(query, cos, sin), apply_rotary_emb(key, cos, sin), value, gate
+
+
+def _qsa_gate_and_project_out(attn_output: torch.Tensor, gate: torch.Tensor, o_weight: torch.Tensor) -> torch.Tensor:
+    """QSA post-attention chain: sigmoid output gate and output projection.
+
+    Args:
+        attn_output: Attention output ``[batch, sequence, heads * head_dim]``.
+        gate: Gate logits ``[batch, sequence, heads * head_dim]``.
+        o_weight: Output projection weight ``[hidden, heads * head_dim]``.
+
+    Returns:
+        Tensor of shape ``[batch, sequence, hidden]``.
+    """
+    return F.linear(attn_output * torch.sigmoid(gate), o_weight)
+
+
+# CUDA only (see the norm compiles above): the eager module path stays for CPU, TE linears and adapters.
+_qsa_project_qkv_compiled = torch.compile(_qsa_project_qkv, dynamic=True)
+_qsa_gate_and_project_out_compiled = torch.compile(_qsa_gate_and_project_out, dynamic=True)
+
+
 class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
     """Qwen3.8-Flash-Next gated attention with compressed-block QSA routing.
 
@@ -566,20 +644,34 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
             packed_cu_seqlens=packed_cu_seqlens,
         )
         selected_token_ids, flex_mask = selection.selected_token_ids, selection.flex_mask
-        query = self.q_proj(x).view(batch_size, sequence_length, -1, self.head_dim * 2)
-        key = self.k_proj(x).view(batch_size, sequence_length, -1, self.head_dim)
-        value = self.v_proj(x).view(batch_size, sequence_length, -1, self.head_dim)
-        query, gate = torch.chunk(query, 2, dim=-1)
-        gate = gate.reshape(*x.shape[:-1], -1)
-        query = self.q_norm(query)
-        key = self.k_norm(key)
-        query, key = apply_rotary_emb_qk(
-            query,
-            key,
-            freqs_cis,
-            format="bshd",
-            rope_fusion=False,
-        )
+        compiled_chain = x.is_cuda and self._plain_projections()
+        if compiled_chain:
+            query, key, value, gate = _qsa_project_qkv_compiled(
+                x,
+                self.q_proj.weight,
+                self.k_proj.weight,
+                self.v_proj.weight,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.q_norm.eps,
+                freqs_cis,
+                self.head_dim,
+            )
+        else:
+            query = self.q_proj(x).view(batch_size, sequence_length, -1, self.head_dim * 2)
+            key = self.k_proj(x).view(batch_size, sequence_length, -1, self.head_dim)
+            value = self.v_proj(x).view(batch_size, sequence_length, -1, self.head_dim)
+            query, gate = torch.chunk(query, 2, dim=-1)
+            gate = gate.reshape(*x.shape[:-1], -1)
+            query = self.q_norm(query)
+            key = self.k_norm(key)
+            query, key = apply_rotary_emb_qk(
+                query,
+                key,
+                freqs_cis,
+                format="bshd",
+                rope_fusion=False,
+            )
         if cp_context is not None:
             key = qwen3_8_flash_next_cp_all_gather(key, cp_context, sequence_dim=1, differentiable=True)
             value = qwen3_8_flash_next_cp_all_gather(value, cp_context, sequence_dim=1, differentiable=True)
@@ -597,8 +689,20 @@ class Qwen3_8_FlashNextQSAAttention(Qwen3NextAttention):
             flex_mask=flex_mask,
         )
         attn_output = attn_output.reshape(*x.shape[:-1], -1).contiguous()
+        if compiled_chain:
+            return _qsa_gate_and_project_out_compiled(attn_output, gate, self.o_proj.weight)
         attn_output = attn_output * torch.sigmoid(gate)
         return self.o_proj(attn_output)
+
+    def _plain_projections(self) -> bool:
+        """True when every projection is a plain ``nn.Linear`` and the norms are the stock RMSNorm.
+
+        Adapters (``LinearLoRA`` subclasses ``nn.Linear``) and TE linears carry forward logic
+        that a weight-only compiled chain would bypass, so they keep the module path.
+        """
+        return all(type(m) is nn.Linear for m in (self.q_proj, self.k_proj, self.v_proj, self.o_proj)) and all(
+            type(m) is Qwen3NextRMSNorm for m in (self.q_norm, self.k_norm)
+        )
 
     def _select_routes(
         self,

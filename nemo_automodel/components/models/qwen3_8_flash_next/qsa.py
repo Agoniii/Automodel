@@ -30,6 +30,7 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.utils._python_dispatch import _disable_current_modes
 
@@ -621,6 +622,64 @@ def qsa_route_selection_region() -> Iterator[None]:
         yield
 
 
+def _indexer_query_key(
+    hidden_states: torch.Tensor,
+    proj_weight: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    eps: float,
+    freqs_cis: torch.Tensor,
+    num_query_heads: int,
+    num_key_heads: int,
+    head_dim: int,
+    compress_ratio: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Indexer front half for the dense path: fused projection, fp32 norms, key pooling and RoPE.
+
+    Same equations as the module path (``index_qk_proj`` -> ``q_layernorm``/``k_layernorm`` ->
+    :func:`apply_qsa_rope`), written over the raw weights so it can be ``torch.compile``d.
+
+    Args:
+        hidden_states: Block input ``[B, S, hidden]``.
+        proj_weight: Fused index projection weight ``[(H_index + 1) * D_index, hidden]``; query
+            columns first, then the single key head.
+        q_norm_weight: Query norm additive scale ``[D_index]``.
+        k_norm_weight: Key norm additive scale ``[D_index]``.
+        eps: Norm epsilon.
+        freqs_cis: Rotary values ``[B, S, D_rope]`` as concatenated cos and sin halves.
+        num_query_heads: ``H_index``.
+        num_key_heads: Index key heads (1).
+        head_dim: ``D_index``.
+        compress_ratio: Tokens per compressed key block.
+
+    Returns:
+        Rotated index queries ``[B, S, H_index, D_index]`` and rotated compressed keys
+        ``[B, S // compress_ratio, 1, D_index]``.
+    """
+    sequence_length = hidden_states.shape[1]
+    projected = F.linear(hidden_states, proj_weight)
+    query_width = num_query_heads * head_dim
+    raw_query = projected[..., :query_width].unflatten(-1, (num_query_heads, head_dim))
+    raw_key = projected[..., query_width:].unflatten(-1, (num_key_heads, head_dim))
+    normalized_query = raw_query.float()
+    normalized_query = normalized_query * torch.rsqrt(normalized_query.pow(2).mean(-1, keepdim=True) + eps)
+    normalized_query = (normalized_query * (1.0 + q_norm_weight.float())).type_as(raw_query)
+    index_query = apply_qsa_rope(normalized_query, freqs_cis)
+
+    num_blocks = sequence_length // compress_ratio
+    grouped_key = raw_key[:, : num_blocks * compress_ratio].unflatten(1, (num_blocks, compress_ratio))
+    compressed_key = grouped_key.float().mean(dim=2).to(raw_key.dtype)
+    normalized_key = compressed_key.float()
+    normalized_key = normalized_key * torch.rsqrt(normalized_key.pow(2).mean(-1, keepdim=True) + eps)
+    normalized_key = (normalized_key * (1.0 + k_norm_weight.float())).type_as(compressed_key)
+    compressed_freqs = freqs_cis[:, : num_blocks * compress_ratio : compress_ratio]
+    return index_query, apply_qsa_rope(normalized_key, compressed_freqs)
+
+
+# CUDA only; CPU and the numerical oracle keep the eager function.
+_indexer_query_key_compiled = torch.compile(_indexer_query_key, dynamic=True)
+
+
 class Qwen3_8_FlashNextQSAIndexer(nn.Module):
     """Frozen, hookable Qwen3.8-Flash-Next compressed-block indexer.
 
@@ -743,17 +802,32 @@ class Qwen3_8_FlashNextQSAIndexer(nn.Module):
                     f"got local={sequence_length}, ratio={self.compress_ratio}"
                 )
 
-        projected = self.index_qk_proj(hidden_states)
-        query_width = self.num_query_heads * self.head_dim
-        raw_query = projected[..., :query_width].unflatten(-1, (self.num_query_heads, self.head_dim))
-        raw_key = projected[..., query_width:].unflatten(-1, (self.num_key_heads, self.head_dim))
-        index_query = apply_qsa_rope(self.q_layernorm(raw_query), freqs_cis)
-
-        num_blocks = sequence_length // self.compress_ratio
-        grouped_key = raw_key[:, : num_blocks * self.compress_ratio].unflatten(1, (num_blocks, self.compress_ratio))
-        compressed_key = grouped_key.float().mean(dim=2).to(raw_key.dtype)
-        compressed_freqs = freqs_cis[:, : num_blocks * self.compress_ratio : self.compress_ratio]
-        compressed_key = apply_qsa_rope(self.k_layernorm(compressed_key), compressed_freqs)
+        if hidden_states.is_cuda and type(self.index_qk_proj) is nn.Linear:
+            index_query, compressed_key = _indexer_query_key_compiled(
+                hidden_states,
+                self.index_qk_proj.weight,
+                self.q_layernorm.weight,
+                self.k_layernorm.weight,
+                self.q_layernorm.eps,
+                freqs_cis,
+                self.num_query_heads,
+                self.num_key_heads,
+                self.head_dim,
+                self.compress_ratio,
+            )
+        else:
+            index_query, compressed_key = _indexer_query_key(
+                hidden_states,
+                self.index_qk_proj.weight,
+                self.q_layernorm.weight,
+                self.k_layernorm.weight,
+                self.q_layernorm.eps,
+                freqs_cis,
+                self.num_query_heads,
+                self.num_key_heads,
+                self.head_dim,
+                self.compress_ratio,
+            )
         if cp_context is not None:
             compressed_key = qwen3_8_flash_next_cp_all_gather(
                 compressed_key,
