@@ -38,6 +38,7 @@ from nemo_automodel.components.models.qwen3_8_flash_next.cp import (
     Qwen3_8_FlashNextCPContext,
     qwen3_8_flash_next_cp_all_gather,
 )
+from nemo_automodel.components.models.qwen3_8_flash_next.hc_norm_triton import HAVE_TRITON, grouped_rms_norm_triton
 from nemo_automodel.components.models.qwen3_8_flash_next.qsa import (
     Qwen3_8_FlashNextQSAIndexer,
     qsa_gqa_attention,
@@ -277,6 +278,9 @@ class Qwen3_8_FlashNextGroupedRMSNorm(nn.Module):
         """
         if hidden_states.shape[-1] != self.hidden_size:
             raise ValueError(f"Expected hidden width {self.hidden_size}, got {hidden_states.shape[-1]}")
+        if hidden_states.is_cuda and HAVE_TRITON:
+            # One fused kernel per direction (see hc_norm_triton); same fp32 math as the chain below.
+            return grouped_rms_norm_triton(hidden_states, self.weight, self.group_size, self.eps)
         norm_fn = _grouped_rms_norm_fp32_compiled if hidden_states.is_cuda else _grouped_rms_norm_fp32
         return norm_fn(hidden_states, self.weight, self.group_size, self.eps)
 
