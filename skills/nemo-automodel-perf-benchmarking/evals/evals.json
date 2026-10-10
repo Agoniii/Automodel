@@ -1,0 +1,45 @@
+[
+  {
+    "id": "nemo-automodel-perf-benchmarking-001-paired-design",
+    "question": "I changed a kernel in a NeMo AutoModel MoE model and want to show it is faster on our 8-node Slurm cluster. How should I measure it?",
+    "expected_skill": "nemo-automodel-perf-benchmarking",
+    "expected_script": null,
+    "ground_truth": "The agent routes to nemo-automodel-perf-benchmarking and proposes a three-phase paired job (baseline A, variant B, baseline again A2) on one allocation and one node set, with a fixed workload, a force-balanced gate labelled as benchmark-only, and a one-GPU environment check first. It says to report step time, tok/s/GPU and MFU together, compare B/A and B/A2, void the pair if A2/A is outside 0.90-1.10, and compare per-step loss and grad_norm against the A/A2 spread.",
+    "expected_behavior": [
+      "Routes to nemo-automodel-perf-benchmarking",
+      "Proposes an A/B/A2 pair on the same nodes in one job",
+      "Fixes the workload and labels force-balance as benchmark-only",
+      "Reports step time, tok/s/GPU and MFU together",
+      "Uses A2/A as the validity gate and the A/A2 spread as the numerics floor",
+      "Runs an environment check before multi-node jobs"
+    ]
+  },
+  {
+    "id": "nemo-automodel-perf-benchmarking-002-noisy-result",
+    "question": "My variant ran at 2180 tok/s/GPU and the baseline at 1990 tok/s/GPU in two separate Slurm jobs yesterday and today. Can I claim +9.5% in the PR?",
+    "expected_skill": "nemo-automodel-perf-benchmarking",
+    "expected_script": null,
+    "ground_truth": "The agent routes to nemo-automodel-perf-benchmarking and says no: cross-job noise on the same configuration has been 17-54% and node groups differ by up to 30%, so only within-job ratios are trustworthy. It asks for a paired A/B/A2 job, checks the per-step series for a step change, and states the claim as B/A and B/A2 from that job with the A2/A noise floor.",
+    "expected_behavior": [
+      "Routes to nemo-automodel-perf-benchmarking",
+      "Rejects the cross-job comparison",
+      "Explains cross-job and node-group noise",
+      "Requests a paired A/B/A2 job on the same nodes",
+      "Mentions step-change inspection and quoting B/A and B/A2"
+    ]
+  },
+  {
+    "id": "nemo-automodel-perf-benchmarking-003-timeline-regime",
+    "question": "An nsys timeline of one microbatch shows 2.1 s wall, 0.8 s of GPU kernel time, 20k kernel launches and 280 host synchronizations. Should I fuse the elementwise norm chain into one Triton kernel?",
+    "expected_skill": "nemo-automodel-perf-benchmarking",
+    "expected_script": null,
+    "ground_truth": "The agent routes to nemo-automodel-perf-benchmarking and diagnoses a host-bound step (GPU busy about 40%). It explains that a GPU-side fusion saves GPU time that does not reach wall-clock while the GPU is waiting on the host, so the fusion should be opt-in or deferred; the higher-value moves are fewer launches per token (larger local batch or sequence), removing per-layer host synchronizations, and replaying deterministic forward decisions on checkpoint recompute. It recommends re-checking after the step becomes GPU-bound.",
+    "expected_behavior": [
+      "Routes to nemo-automodel-perf-benchmarking",
+      "Computes GPU-busy fraction and classifies the step as host-bound",
+      "Explains why kernel fusion does not show in wall-clock here",
+      "Recommends launch and synchronization reductions first",
+      "Suggests re-measuring once the GPU is on the critical path"
+    ]
+  }
+]
